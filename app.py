@@ -6,6 +6,7 @@ from datetime import datetime
 from pathlib import Path
 from threading import Lock
 from typing import Any
+import os
 import time
 
 import av
@@ -18,6 +19,8 @@ from ultralytics import YOLO
 CAPTURE_DIR = Path("captures")
 CAPTURE_DIR.mkdir(parents=True, exist_ok=True)
 MODEL_WEIGHTS = "yolov8l.pt"
+# Streamlit Cloud often has a non-writable home config path.
+os.environ.setdefault("YOLO_CONFIG_DIR", "/tmp/Ultralytics")
 
 
 @dataclass
@@ -262,6 +265,37 @@ def create_video_callback(
     return callback
 
 
+def build_rtc_configuration() -> dict[str, Any]:
+    # Multiple STUN servers improve connection reliability across networks.
+    ice_servers: list[dict[str, Any]] = [
+        {"urls": ["stun:stun.l.google.com:19302", "stun:stun1.l.google.com:19302"]},
+        {"urls": ["stun:stun.cloudflare.com:3478"]},
+    ]
+
+    # Optional TURN configuration from Streamlit secrets or environment variables.
+    turn_urls = st.secrets.get("TURN_URLS", os.getenv("TURN_URLS", ""))
+    turn_username = st.secrets.get("TURN_USERNAME", os.getenv("TURN_USERNAME", ""))
+    turn_password = st.secrets.get("TURN_PASSWORD", os.getenv("TURN_PASSWORD", ""))
+
+    if isinstance(turn_urls, str):
+        parsed_urls = [u.strip() for u in turn_urls.split(",") if u.strip()]
+    elif isinstance(turn_urls, list):
+        parsed_urls = [str(u).strip() for u in turn_urls if str(u).strip()]
+    else:
+        parsed_urls = []
+
+    if parsed_urls and turn_username and turn_password:
+        ice_servers.append(
+            {
+                "urls": parsed_urls,
+                "username": str(turn_username),
+                "credential": str(turn_password),
+            }
+        )
+
+    return {"iceServers": ice_servers, "iceTransportPolicy": "all"}
+
+
 st.set_page_config(page_title="Live Object Detection & Tracing", layout="wide")
 
 RUNTIME = get_runtime()
@@ -360,7 +394,7 @@ with video_col:
         key="object-detection",
         video_frame_callback=video_callback,
         async_processing=True,
-        rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
+        rtc_configuration=build_rtc_configuration(),
         media_stream_constraints={"video": True, "audio": False},
     )
     st.markdown(
