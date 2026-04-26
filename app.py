@@ -11,10 +11,16 @@ import time
 import math
 from io import BytesIO
 
-import av
 import numpy as np
 import streamlit as st
 from PIL import Image
+try:
+    import av
+    AV_IMPORT_ERROR = ""
+except Exception as av_import_error:
+    av = None
+    AV_IMPORT_ERROR = str(av_import_error)
+
 try:
     import cv2
     CV2_IMPORT_ERROR = ""
@@ -266,6 +272,8 @@ def create_video_callback(
     process_every_n_frames: int,
     inference_size: int,
 ) -> Any:
+    if av is None:
+        return None
     names = {} if model is None else model.names
     callback_state = {"frame_index": 0}
 
@@ -538,7 +546,7 @@ st.write(
 
 with st.sidebar:
     is_cloud = bool(os.getenv("STREAMLIT_SHARING_MODE")) or "/mount/src" in str(Path.cwd()).replace("\\", "/")
-    if is_cloud or webrtc_streamer is None:
+    if is_cloud or webrtc_streamer is None or av is None:
         mode_options = ["Stable Snapshot"]
         default_mode = "Stable Snapshot"
     else:
@@ -594,29 +602,31 @@ with st.sidebar:
         reset_runtime()
         st.success("Session stats reset.")
 
-video_callback = create_video_callback(
-    model=model,
-    conf_threshold=conf_threshold,
-    iou_threshold=iou_threshold,
-    alert_targets=set(alert_targets),
-    alert_confidence=alert_confidence,
-    alert_cooldown_sec=alert_cooldown_sec,
-    auto_capture=auto_capture,
-    auto_capture_interval_sec=auto_capture_interval_sec,
-    process_every_n_frames=process_every_n_frames,
-    inference_size=inference_size,
-)
-
 video_col, info_col = st.columns([1.9, 1.1], gap="medium")
 
 with video_col:
     st.subheader("Live Preview")
     if capture_mode == "Realtime WebRTC (Beta)":
-        if webrtc_streamer is None:
-            st.error("streamlit-webrtc import failed. Switch to Stable Snapshot mode.")
-            st.code(WEBRTC_IMPORT_ERROR)
+        if webrtc_streamer is None or av is None:
+            st.error("WebRTC dependencies are unavailable. Switch to Stable Snapshot mode.")
+            if WEBRTC_IMPORT_ERROR:
+                st.code(WEBRTC_IMPORT_ERROR)
+            if AV_IMPORT_ERROR:
+                st.code(AV_IMPORT_ERROR)
         else:
             try:
+                video_callback = create_video_callback(
+                    model=model,
+                    conf_threshold=conf_threshold,
+                    iou_threshold=iou_threshold,
+                    alert_targets=set(alert_targets),
+                    alert_confidence=alert_confidence,
+                    alert_cooldown_sec=alert_cooldown_sec,
+                    auto_capture=auto_capture,
+                    auto_capture_interval_sec=auto_capture_interval_sec,
+                    process_every_n_frames=process_every_n_frames,
+                    inference_size=inference_size,
+                )
                 webrtc_streamer(
                     key="object-detection",
                     video_frame_callback=video_callback,
@@ -630,11 +640,23 @@ with video_col:
                 )
                 st.caption(f"WebRTC error: {type(webrtc_error).__name__}")
     else:
-        st.caption("Press the camera button below to capture a frame, then detection runs automatically.")
+        st.caption("Capture a photo or upload an image, then detection runs automatically.")
         snapshot = st.camera_input("Take a Snapshot")
+        uploaded_image = st.file_uploader(
+            "Or Upload an Image",
+            type=["jpg", "jpeg", "png", "webp"],
+            accept_multiple_files=False,
+        )
+
+        image_bytes = None
         if snapshot is not None:
+            image_bytes = snapshot.getvalue()
+        elif uploaded_image is not None:
+            image_bytes = uploaded_image.getvalue()
+
+        if image_bytes is not None:
             try:
-                pil_img = Image.open(BytesIO(snapshot.getvalue())).convert("RGB")
+                pil_img = Image.open(BytesIO(image_bytes)).convert("RGB")
                 rgb = np.array(pil_img)
                 if model is None:
                     st.error("Detection unavailable because YOLO failed to load.")
