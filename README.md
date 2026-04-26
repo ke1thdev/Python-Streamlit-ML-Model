@@ -7,6 +7,7 @@
   <img alt="YOLOv8" src="https://img.shields.io/badge/YOLOv8-Ultralytics-111111" />
   <img alt="WebRTC" src="https://img.shields.io/badge/WebRTC-Live%20Video-0A66C2" />
   <img alt="Status" src="https://img.shields.io/badge/Project-Complete-2E7D32" />
+  <img alt="Views" src="https://hits.seeyoufarm.com/api/count/incr/badge.svg?url=https%3A%2F%2Fgithub.com%2Fkeithdev%2Fpython-streamlit-ml-model&count_bg=%232E7D32&title_bg=%23555555&icon=github.svg&icon_color=%23FFFFFF&title=Views&edge_flat=false" />
 </p>
 
 <hr />
@@ -23,7 +24,7 @@ The current configured model is <code>yolov8l.pt</code> to prioritize stronger d
 
 <hr />
 
-<h2>2. Task Alignment (Based on <code>task.md</code>)</h2>
+<h2>2. Task Alignment</h2>
 <h3>Expected Software Output</h3>
 <ul>
   <li>Functional web app with title <code>Live Object Detection &amp; Tracing</code>.</li>
