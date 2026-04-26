@@ -33,9 +33,11 @@ from ultralytics import YOLO
 
 CAPTURE_DIR = Path("captures")
 CAPTURE_DIR.mkdir(parents=True, exist_ok=True)
-MODEL_WEIGHTS = "yolov8l.pt"
+MODEL_WEIGHTS = os.getenv("YOLO_WEIGHTS", "yolov8n.pt")
 # Streamlit Cloud often has a non-writable home config path.
 os.environ.setdefault("YOLO_CONFIG_DIR", "/tmp/Ultralytics")
+# Prevent runtime package auto-install attempts on read-only cloud environments.
+os.environ.setdefault("YOLO_AUTOINSTALL", "False")
 
 
 @dataclass
@@ -64,15 +66,30 @@ def get_runtime() -> RuntimeState:
 
 
 @st.cache_resource
-def load_model() -> YOLO:
-    return YOLO(MODEL_WEIGHTS)
+def load_model() -> tuple[YOLO | None, str]:
+    try:
+        return YOLO(MODEL_WEIGHTS), ""
+    except Exception as model_error:
+        return None, f"{type(model_error).__name__}: {model_error}"
 
 
-def get_model_names(model: YOLO) -> list[str]:
+def get_model_names(model: YOLO | None) -> list[str]:
+    if model is None:
+        return []
     names = model.names
     if isinstance(names, dict):
         return [str(names[i]) for i in sorted(names.keys())]
     return [str(n) for n in names]
+
+
+def get_label_from_names(names: Any, cls_id: int) -> str:
+    if isinstance(names, dict):
+        return str(names.get(int(cls_id), cls_id))
+    if isinstance(names, (list, tuple)):
+        idx = int(cls_id)
+        if 0 <= idx < len(names):
+            return str(names[idx])
+    return str(cls_id)
 
 
 def save_frame(image: Any, reason: str) -> str:
@@ -224,7 +241,7 @@ def overlay_hud(frame: Any, fps: float, current_counts: Counter, latest_alert: s
 
 
 def create_video_callback(
-    model: YOLO,
+    model: YOLO | None,
     conf_threshold: float,
     iou_threshold: float,
     alert_targets: set[str],
@@ -235,18 +252,18 @@ def create_video_callback(
     process_every_n_frames: int,
     inference_size: int,
 ) -> Any:
-    names = model.names
+    names = {} if model is None else model.names
     callback_state = {"frame_index": 0}
 
     def get_label(cls_id: int) -> str:
-        if isinstance(names, dict):
-            return str(names.get(int(cls_id), cls_id))
-        return str(names[int(cls_id)])
+        return get_label_from_names(names, cls_id)
 
     def callback(frame: av.VideoFrame) -> av.VideoFrame:
         callback_state["frame_index"] += 1
         img = frame.to_ndarray(format="bgr24")
         now = time.time()
+        if model is None:
+            return av.VideoFrame.from_ndarray(img, format="bgr24")
 
         # Skip inference on selected frames for smoother UI on slower machines.
         if process_every_n_frames > 1 and callback_state["frame_index"] % process_every_n_frames != 0:
@@ -264,17 +281,20 @@ def create_video_callback(
             if cached is not None:
                 return av.VideoFrame.from_ndarray(cached, format="bgr24")
 
-        results = model.predict(
-            img,
-            conf=conf_threshold,
-            iou=iou_threshold,
-            imgsz=inference_size,
-            max_det=24,
-            verbose=False,
-        )
-
-        result = results[0]
-        annotated = result.plot()
+        try:
+            results = model.predict(
+                img,
+                conf=conf_threshold,
+                iou=iou_threshold,
+                imgsz=inference_size,
+                max_det=24,
+                verbose=False,
+            )
+            result = results[0]
+            annotated = result.plot()
+        except Exception:
+            # Keep stream alive even if a single inference fails.
+            return av.VideoFrame.from_ndarray(img, format="bgr24")
         current_counts: Counter = Counter()
         latest_alert = ""
         new_track_keys: list[tuple[str, int]] = []
@@ -386,7 +406,7 @@ def build_rtc_configuration() -> dict[str, Any]:
 
 def process_snapshot_frame(
     img: Any,
-    model: YOLO,
+    model: YOLO | None,
     conf_threshold: float,
     iou_threshold: float,
     alert_targets: set[str],
@@ -394,15 +414,20 @@ def process_snapshot_frame(
     alert_cooldown_sec: float,
     inference_size: int,
 ) -> Any:
+    if model is None:
+        return img
     now = time.time()
-    result = model.predict(
-        img,
-        conf=conf_threshold,
-        iou=iou_threshold,
-        imgsz=inference_size,
-        max_det=24,
-        verbose=False,
-    )[0]
+    try:
+        result = model.predict(
+            img,
+            conf=conf_threshold,
+            iou=iou_threshold,
+            imgsz=inference_size,
+            max_det=24,
+            verbose=False,
+        )[0]
+    except Exception:
+        return img
 
     annotated = result.plot()
     current_counts: Counter = Counter()
@@ -418,7 +443,7 @@ def process_snapshot_frame(
         bboxes = boxes.xyxy.tolist()
         for cls_id, cls_conf, bbox in zip(cls_ids, confs, bboxes):
             x1, y1, x2, y2 = bbox
-            label = str(names.get(int(cls_id), cls_id)) if isinstance(names, dict) else str(names[int(cls_id)])
+            label = get_label_from_names(names, cls_id)
             current_counts[label] += 1
             detections.append(
                 {
@@ -457,13 +482,17 @@ def process_snapshot_frame(
 st.set_page_config(page_title="Live Object Detection & Tracing", layout="wide")
 
 RUNTIME = get_runtime()
-model = load_model()
+model, model_error = load_model()
 available_labels = get_model_names(model)
 
 if cv2 is None:
     st.error("OpenCV failed to load in this environment.")
     st.code(CV2_IMPORT_ERROR)
     st.stop()
+
+if model is None:
+    st.error("YOLO model failed to load. Detection will be disabled until this is fixed.")
+    st.code(model_error)
 
 st.markdown(
     """
@@ -495,13 +524,16 @@ st.write(
 
 with st.sidebar:
     is_cloud = bool(os.getenv("STREAMLIT_SHARING_MODE")) or "/mount/src" in str(Path.cwd()).replace("\\", "/")
-    default_mode = "Stable Snapshot"
-    if not is_cloud and webrtc_streamer is not None:
+    if is_cloud or webrtc_streamer is None:
+        mode_options = ["Stable Snapshot"]
+        default_mode = "Stable Snapshot"
+    else:
+        mode_options = ["Stable Snapshot", "Realtime WebRTC (Beta)"]
         default_mode = "Realtime WebRTC (Beta)"
 
     capture_mode = st.selectbox(
         "Capture Mode",
-        options=["Stable Snapshot", "Realtime WebRTC (Beta)"],
+        options=mode_options,
         index=0 if default_mode == "Stable Snapshot" else 1,
         help="Use Stable Snapshot on Streamlit Cloud. WebRTC can crash on Python 3.14 runtimes.",
     )
@@ -527,7 +559,7 @@ with st.sidebar:
         "Target Objects",
         options=available_labels,
         default=["person", "cell phone", "bottle"]
-        if all(x in available_labels for x in ["person", "cell phone", "bottle"])
+        if available_labels and all(x in available_labels for x in ["person", "cell phone", "bottle"])
         else available_labels[:3],
     )
     alert_confidence = st.slider("Min Alert Confidence", 0.10, 0.99, 0.60, 0.05)
@@ -590,22 +622,25 @@ with video_col:
             try:
                 pil_img = Image.open(BytesIO(snapshot.getvalue())).convert("RGB")
                 rgb = np.array(pil_img)
-                with st.spinner("Running detection..."):
-                    out = process_snapshot_frame(
-                        rgb,
-                        model=model,
-                        conf_threshold=conf_threshold,
-                        iou_threshold=iou_threshold,
-                        alert_targets=set(alert_targets),
-                        alert_confidence=alert_confidence,
-                        alert_cooldown_sec=alert_cooldown_sec,
-                        inference_size=inference_size,
-                    )
-                if cv2 is not None:
-                    out_rgb = cv2.cvtColor(out, cv2.COLOR_BGR2RGB)
-                    st.image(out_rgb, use_container_width=True)
+                if model is None:
+                    st.error("Detection unavailable because YOLO failed to load.")
                 else:
-                    st.image(out, use_container_width=True)
+                    with st.spinner("Running detection..."):
+                        out = process_snapshot_frame(
+                            rgb,
+                            model=model,
+                            conf_threshold=conf_threshold,
+                            iou_threshold=iou_threshold,
+                            alert_targets=set(alert_targets),
+                            alert_confidence=alert_confidence,
+                            alert_cooldown_sec=alert_cooldown_sec,
+                            inference_size=inference_size,
+                        )
+                    if cv2 is not None:
+                        out_rgb = cv2.cvtColor(out, cv2.COLOR_BGR2RGB)
+                        st.image(out_rgb, use_container_width=True)
+                    else:
+                        st.image(out, use_container_width=True)
 
                 current = snapshot_runtime()["current_frame_counts"]
                 if current:
