@@ -62,7 +62,19 @@ class RuntimeState:
 @st.cache_resource
 def get_runtime() -> RuntimeState:
     # Keep one shared runtime object across Streamlit reruns.
-    return RuntimeState()
+    runtime = RuntimeState()
+    ensure_runtime_compat(runtime)
+    return runtime
+
+
+def ensure_runtime_compat(runtime: RuntimeState) -> None:
+    # Guard against stale cached RuntimeState objects missing newer attributes.
+    if not hasattr(runtime, "active_tracks"):
+        runtime.active_tracks = {}
+    if not hasattr(runtime, "next_track_id"):
+        runtime.next_track_id = 1
+    if not hasattr(runtime, "saved_frames"):
+        runtime.saved_frames = 0
 
 
 @st.cache_resource
@@ -117,6 +129,7 @@ def snapshot_runtime() -> dict[str, Any]:
 
 def reset_runtime() -> None:
     with RUNTIME.lock:
+        ensure_runtime_compat(RUNTIME)
         RUNTIME.latest_annotated_frame = None
         RUNTIME.frames_processed = 0
         RUNTIME.fps_window_count = 0
@@ -145,6 +158,7 @@ def assign_lightweight_tracks(
     Matches detections to existing tracks by label + centroid distance.
     """
     with RUNTIME.lock:
+        ensure_runtime_compat(RUNTIME)
         # Drop stale tracks.
         stale_ids = [
             tid
