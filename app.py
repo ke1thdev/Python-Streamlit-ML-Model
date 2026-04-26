@@ -9,11 +9,9 @@ from typing import Any
 import os
 import time
 import math
-from io import BytesIO
 
 import numpy as np
 import streamlit as st
-from PIL import Image
 try:
     import av
     AV_IMPORT_ERROR = ""
@@ -541,25 +539,10 @@ h1, h2, h3 {
 
 st.title("Live Object Detection & Tracing")
 st.write(
-    f"Real-time {MODEL_WEIGHTS} detection and tracking with compact controls, alerting, and frame capture."
+    f"Real-time {MODEL_WEIGHTS} detection and tracking with compact controls and alerting."
 )
 
 with st.sidebar:
-    is_cloud = bool(os.getenv("STREAMLIT_SHARING_MODE")) or "/mount/src" in str(Path.cwd()).replace("\\", "/")
-    if is_cloud or webrtc_streamer is None or av is None:
-        mode_options = ["Stable Snapshot"]
-        default_mode = "Stable Snapshot"
-    else:
-        mode_options = ["Stable Snapshot", "Realtime WebRTC (Beta)"]
-        default_mode = "Realtime WebRTC (Beta)"
-
-    capture_mode = st.selectbox(
-        "Capture Mode",
-        options=mode_options,
-        index=0 if default_mode == "Stable Snapshot" else 1,
-        help="Use Stable Snapshot on Streamlit Cloud. WebRTC can crash on Python 3.14 runtimes.",
-    )
-
     st.header("Detection")
     conf_threshold = st.slider("Confidence", 0.10, 0.95, 0.25, 0.05)
     iou_threshold = st.slider("IoU", 0.10, 0.95, 0.50, 0.05)
@@ -587,17 +570,6 @@ with st.sidebar:
     alert_confidence = st.slider("Min Alert Confidence", 0.10, 0.99, 0.60, 0.05)
     alert_cooldown_sec = st.slider("Alert Cooldown (s)", 1.0, 20.0, 4.0, 1.0)
 
-    st.header("Capture")
-    auto_capture = st.checkbox("Auto-save on detection", value=False)
-    auto_capture_interval_sec = st.slider(
-        "Auto-capture interval (s)",
-        1.0,
-        30.0,
-        5.0,
-        1.0,
-        disabled=not auto_capture,
-    )
-
     if st.button("Reset Session Stats"):
         reset_runtime()
         st.success("Session stats reset.")
@@ -606,90 +578,39 @@ video_col, info_col = st.columns([1.9, 1.1], gap="medium")
 
 with video_col:
     st.subheader("Live Preview")
-    if capture_mode == "Realtime WebRTC (Beta)":
-        if webrtc_streamer is None or av is None:
-            st.error("WebRTC dependencies are unavailable. Switch to Stable Snapshot mode.")
-            if WEBRTC_IMPORT_ERROR:
-                st.code(WEBRTC_IMPORT_ERROR)
-            if AV_IMPORT_ERROR:
-                st.code(AV_IMPORT_ERROR)
-        else:
-            try:
-                video_callback = create_video_callback(
-                    model=model,
-                    conf_threshold=conf_threshold,
-                    iou_threshold=iou_threshold,
-                    alert_targets=set(alert_targets),
-                    alert_confidence=alert_confidence,
-                    alert_cooldown_sec=alert_cooldown_sec,
-                    auto_capture=auto_capture,
-                    auto_capture_interval_sec=auto_capture_interval_sec,
-                    process_every_n_frames=process_every_n_frames,
-                    inference_size=inference_size,
-                )
-                webrtc_streamer(
-                    key="object-detection",
-                    video_frame_callback=video_callback,
-                    async_processing=True,
-                    rtc_configuration=build_rtc_configuration(),
-                    media_stream_constraints={"video": True, "audio": False},
-                )
-            except Exception as webrtc_error:
-                st.error(
-                    "WebRTC session failed. Switch Capture Mode to Stable Snapshot."
-                )
-                st.caption(f"WebRTC error: {type(webrtc_error).__name__}")
+    if webrtc_streamer is None or av is None:
+        st.error("Realtime preview is unavailable because WebRTC dependencies failed to load.")
+        if WEBRTC_IMPORT_ERROR:
+            st.code(WEBRTC_IMPORT_ERROR)
+        if AV_IMPORT_ERROR:
+            st.code(AV_IMPORT_ERROR)
     else:
-        st.caption("Capture a photo or upload an image, then detection runs automatically.")
-        snapshot = st.camera_input("Take a Snapshot")
-        uploaded_image = st.file_uploader(
-            "Or Upload an Image",
-            type=["jpg", "jpeg", "png", "webp"],
-            accept_multiple_files=False,
-        )
-
-        image_bytes = None
-        if snapshot is not None:
-            image_bytes = snapshot.getvalue()
-        elif uploaded_image is not None:
-            image_bytes = uploaded_image.getvalue()
-
-        if image_bytes is not None:
-            try:
-                pil_img = Image.open(BytesIO(image_bytes)).convert("RGB")
-                rgb = np.array(pil_img)
-                if model is None:
-                    st.error("Detection unavailable because YOLO failed to load.")
-                else:
-                    with st.spinner("Running detection..."):
-                        out = process_snapshot_frame(
-                            rgb,
-                            model=model,
-                            conf_threshold=conf_threshold,
-                            iou_threshold=iou_threshold,
-                            alert_targets=set(alert_targets),
-                            alert_confidence=alert_confidence,
-                            alert_cooldown_sec=alert_cooldown_sec,
-                            inference_size=inference_size,
-                        )
-                    if cv2 is not None:
-                        out_rgb = cv2.cvtColor(out, cv2.COLOR_BGR2RGB)
-                        st.image(out_rgb, use_container_width=True)
-                    else:
-                        st.image(out, use_container_width=True)
-
-                current = snapshot_runtime()["current_frame_counts"]
-                if current:
-                    st.success(
-                        "Detected: "
-                        + ", ".join([f"{k} ({v})" for k, v in list(current.items())[:6]])
-                    )
-                else:
-                    st.warning("No objects detected in this snapshot. Try better lighting or lower confidence.")
-            except Exception as snap_error:
-                st.error(f"Snapshot detection failed: {type(snap_error).__name__}")
+        try:
+            video_callback = create_video_callback(
+                model=model,
+                conf_threshold=conf_threshold,
+                iou_threshold=iou_threshold,
+                alert_targets=set(alert_targets),
+                alert_confidence=alert_confidence,
+                alert_cooldown_sec=alert_cooldown_sec,
+                auto_capture=False,
+                auto_capture_interval_sec=60.0,
+                process_every_n_frames=process_every_n_frames,
+                inference_size=inference_size,
+            )
+            webrtc_streamer(
+                key="object-detection",
+                video_frame_callback=video_callback,
+                async_processing=True,
+                desired_playing_state=True,
+                rtc_configuration=build_rtc_configuration(),
+                media_stream_constraints={"video": True, "audio": False},
+            )
+        except Exception as webrtc_error:
+            st.error("WebRTC session failed to start.")
+            st.caption(f"WebRTC error: {type(webrtc_error).__name__}")
     st.markdown(
-        '<div class="small-note">Tip: Stable Snapshot mode is recommended for Streamlit Cloud reliability.</div>',
+        '<div class="small-note">Use the Start button above the video widget to begin realtime detection.</div>',
         unsafe_allow_html=True,
     )
 
@@ -698,25 +619,11 @@ with info_col:
     m1, m2 = st.columns(2)
     m1.metric("Frames", stats["frames_processed"])
     m2.metric("FPS", f"{stats['fps']:.1f}")
-    st.metric("Saved Frames", stats["saved_frames"])
 
     if stats["latest_alert_message"]:
         st.warning(stats["latest_alert_message"])
     else:
         st.caption("No active alerts.")
-
-    if st.button("Save Current Frame", use_container_width=True):
-        with RUNTIME.lock:
-            frame_copy = (
-                None if RUNTIME.latest_annotated_frame is None else RUNTIME.latest_annotated_frame.copy()
-            )
-        if frame_copy is None:
-            st.error("Start camera streaming first.")
-        else:
-            saved_to = save_frame(frame_copy, "manual_capture")
-            with RUNTIME.lock:
-                RUNTIME.saved_frames += 1
-            st.success(f"Saved: {saved_to}")
 
     with st.expander("Current Counts", expanded=True):
         if stats["current_frame_counts"]:
@@ -750,13 +657,3 @@ with info_col:
                 st.write(f"- {alert_line}")
         else:
             st.caption("No alerts recorded.")
-
-with st.expander("Saved Captures", expanded=False):
-    saved_images = sorted(CAPTURE_DIR.glob("*.jpg"), key=lambda p: p.stat().st_mtime, reverse=True)[:6]
-    if saved_images:
-        gallery_columns = st.columns(3)
-        for idx, image_path in enumerate(saved_images):
-            with gallery_columns[idx % 3]:
-                st.image(str(image_path), caption=image_path.name, use_container_width=True)
-    else:
-        st.caption("No saved captures yet.")
