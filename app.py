@@ -9,10 +9,12 @@ from typing import Any
 import os
 import time
 import math
+from io import BytesIO
 
 import av
 import numpy as np
 import streamlit as st
+from PIL import Image
 try:
     import cv2
     CV2_IMPORT_ERROR = ""
@@ -505,7 +507,7 @@ with st.sidebar:
     )
 
     st.header("Detection")
-    conf_threshold = st.slider("Confidence", 0.10, 0.95, 0.50, 0.05)
+    conf_threshold = st.slider("Confidence", 0.10, 0.95, 0.25, 0.05)
     iou_threshold = st.slider("IoU", 0.10, 0.95, 0.50, 0.05)
     inference_size = st.select_slider(
         "Inference Size",
@@ -582,27 +584,39 @@ with video_col:
                 )
                 st.caption(f"WebRTC error: {type(webrtc_error).__name__}")
     else:
+        st.caption("Press the camera button below to capture a frame, then detection runs automatically.")
         snapshot = st.camera_input("Take a Snapshot")
         if snapshot is not None:
-            file_bytes = snapshot.getvalue()
-            arr = cv2.imdecode(
-                np.frombuffer(file_bytes, dtype=np.uint8),  # type: ignore[name-defined]
-                cv2.IMREAD_COLOR,
-            )
-            if arr is not None:
-                out = process_snapshot_frame(
-                    arr,
-                    model=model,
-                    conf_threshold=conf_threshold,
-                    iou_threshold=iou_threshold,
-                    alert_targets=set(alert_targets),
-                    alert_confidence=alert_confidence,
-                    alert_cooldown_sec=alert_cooldown_sec,
-                    inference_size=inference_size,
-                )
-                st.image(out, channels="BGR", use_container_width=True)
-            else:
-                st.error("Could not decode snapshot image.")
+            try:
+                pil_img = Image.open(BytesIO(snapshot.getvalue())).convert("RGB")
+                rgb = np.array(pil_img)
+                with st.spinner("Running detection..."):
+                    out = process_snapshot_frame(
+                        rgb,
+                        model=model,
+                        conf_threshold=conf_threshold,
+                        iou_threshold=iou_threshold,
+                        alert_targets=set(alert_targets),
+                        alert_confidence=alert_confidence,
+                        alert_cooldown_sec=alert_cooldown_sec,
+                        inference_size=inference_size,
+                    )
+                if cv2 is not None:
+                    out_rgb = cv2.cvtColor(out, cv2.COLOR_BGR2RGB)
+                    st.image(out_rgb, use_container_width=True)
+                else:
+                    st.image(out, use_container_width=True)
+
+                current = snapshot_runtime()["current_frame_counts"]
+                if current:
+                    st.success(
+                        "Detected: "
+                        + ", ".join([f"{k} ({v})" for k, v in list(current.items())[:6]])
+                    )
+                else:
+                    st.warning("No objects detected in this snapshot. Try better lighting or lower confidence.")
+            except Exception as snap_error:
+                st.error(f"Snapshot detection failed: {type(snap_error).__name__}")
     st.markdown(
         '<div class="small-note">Tip: Stable Snapshot mode is recommended for Streamlit Cloud reliability.</div>',
         unsafe_allow_html=True,
