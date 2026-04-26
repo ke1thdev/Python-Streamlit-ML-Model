@@ -1,0 +1,437 @@
+from __future__ import annotations
+
+from collections import Counter
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+from threading import Lock
+from typing import Any
+import time
+
+import av
+import cv2
+import streamlit as st
+from streamlit_webrtc import webrtc_streamer
+from ultralytics import YOLO
+
+
+CAPTURE_DIR = Path("captures")
+CAPTURE_DIR.mkdir(parents=True, exist_ok=True)
+MODEL_WEIGHTS = "yolov8l.pt"
+
+
+@dataclass
+class RuntimeState:
+    lock: Lock = field(default_factory=Lock)
+    latest_annotated_frame: Any = None
+    frames_processed: int = 0
+    fps_window_count: int = 0
+    fps_window_start: float = field(default_factory=time.time)
+    fps: float = 0.0
+    current_frame_counts: Counter = field(default_factory=Counter)
+    session_track_counts: Counter = field(default_factory=Counter)
+    seen_tracks: set[tuple[str, int]] = field(default_factory=set)
+    last_alert_time: dict[str, float] = field(default_factory=dict)
+    latest_alert_message: str = ""
+    alert_history: list[str] = field(default_factory=list)
+    saved_frames: int = 0
+    last_auto_capture_ts: float = 0.0
+
+@st.cache_resource
+def get_runtime() -> RuntimeState:
+    # Keep one shared runtime object across Streamlit reruns.
+    return RuntimeState()
+
+
+@st.cache_resource
+def load_model() -> YOLO:
+    return YOLO(MODEL_WEIGHTS)
+
+
+def get_model_names(model: YOLO) -> list[str]:
+    names = model.names
+    if isinstance(names, dict):
+        return [str(names[i]) for i in sorted(names.keys())]
+    return [str(n) for n in names]
+
+
+def save_frame(image: Any, reason: str) -> str:
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    out_path = CAPTURE_DIR / f"{reason}_{timestamp}.jpg"
+    cv2.imwrite(str(out_path), image)
+    return str(out_path)
+
+
+def snapshot_runtime() -> dict[str, Any]:
+    with RUNTIME.lock:
+        return {
+            "frames_processed": RUNTIME.frames_processed,
+            "fps": RUNTIME.fps,
+            "current_frame_counts": dict(RUNTIME.current_frame_counts),
+            "session_track_counts": dict(RUNTIME.session_track_counts),
+            "latest_alert_message": RUNTIME.latest_alert_message,
+            "alert_history": list(RUNTIME.alert_history[-8:]),
+            "saved_frames": RUNTIME.saved_frames,
+            "latest_frame_available": RUNTIME.latest_annotated_frame is not None,
+        }
+
+
+def reset_runtime() -> None:
+    with RUNTIME.lock:
+        RUNTIME.latest_annotated_frame = None
+        RUNTIME.frames_processed = 0
+        RUNTIME.fps_window_count = 0
+        RUNTIME.fps_window_start = time.time()
+        RUNTIME.fps = 0.0
+        RUNTIME.current_frame_counts = Counter()
+        RUNTIME.session_track_counts = Counter()
+        RUNTIME.seen_tracks = set()
+        RUNTIME.last_alert_time = {}
+        RUNTIME.latest_alert_message = ""
+        RUNTIME.alert_history = []
+        RUNTIME.saved_frames = 0
+        RUNTIME.last_auto_capture_ts = 0.0
+
+
+def overlay_hud(frame: Any, fps: float, current_counts: Counter, latest_alert: str) -> Any:
+    hud = frame.copy()
+    cv2.rectangle(hud, (10, 10), (520, 160), (0, 0, 0), -1)
+    cv2.addWeighted(hud, 0.35, frame, 0.65, 0, frame)
+
+    cv2.putText(
+        frame,
+        f"FPS: {fps:.1f}",
+        (20, 40),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.8,
+        (0, 255, 255),
+        2,
+        cv2.LINE_AA,
+    )
+
+    top_counts = ", ".join(
+        [f"{label}:{count}" for label, count in current_counts.most_common(4)]
+    )
+    if not top_counts:
+        top_counts = "No objects detected"
+
+    cv2.putText(
+        frame,
+        top_counts[:62],
+        (20, 78),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.65,
+        (255, 255, 255),
+        2,
+        cv2.LINE_AA,
+    )
+
+    alert_text = latest_alert if latest_alert else "Alert: none"
+    cv2.putText(
+        frame,
+        alert_text[:62],
+        (20, 116),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.6,
+        (60, 160, 255) if latest_alert else (180, 180, 180),
+        2,
+        cv2.LINE_AA,
+    )
+    return frame
+
+
+def create_video_callback(
+    model: YOLO,
+    conf_threshold: float,
+    iou_threshold: float,
+    alert_targets: set[str],
+    alert_confidence: float,
+    alert_cooldown_sec: float,
+    auto_capture: bool,
+    auto_capture_interval_sec: float,
+    process_every_n_frames: int,
+    inference_size: int,
+) -> Any:
+    names = model.names
+    callback_state = {"frame_index": 0}
+
+    def get_label(cls_id: int) -> str:
+        if isinstance(names, dict):
+            return str(names.get(int(cls_id), cls_id))
+        return str(names[int(cls_id)])
+
+    def callback(frame: av.VideoFrame) -> av.VideoFrame:
+        callback_state["frame_index"] += 1
+        img = frame.to_ndarray(format="bgr24")
+        now = time.time()
+
+        # Skip inference on selected frames for smoother UI on slower machines.
+        if process_every_n_frames > 1 and callback_state["frame_index"] % process_every_n_frames != 0:
+            with RUNTIME.lock:
+                RUNTIME.frames_processed += 1
+                RUNTIME.fps_window_count += 1
+                elapsed = now - RUNTIME.fps_window_start
+                if elapsed >= 1.0:
+                    RUNTIME.fps = RUNTIME.fps_window_count / max(elapsed, 1e-6)
+                    RUNTIME.fps_window_count = 0
+                    RUNTIME.fps_window_start = now
+                cached = (
+                    None if RUNTIME.latest_annotated_frame is None else RUNTIME.latest_annotated_frame.copy()
+                )
+            if cached is not None:
+                return av.VideoFrame.from_ndarray(cached, format="bgr24")
+
+        results = model.track(
+            img,
+            persist=True,
+            conf=conf_threshold,
+            iou=iou_threshold,
+            imgsz=inference_size,
+            max_det=24,
+            verbose=False,
+        )
+
+        result = results[0]
+        annotated = result.plot()
+        current_counts: Counter = Counter()
+        latest_alert = ""
+        new_track_keys: list[tuple[str, int]] = []
+        fired_alerts: list[str] = []
+
+        boxes = result.boxes
+        if boxes is not None and boxes.cls is not None:
+            cls_ids = boxes.cls.int().tolist()
+            confs = boxes.conf.tolist() if boxes.conf is not None else [1.0] * len(cls_ids)
+            track_ids = boxes.id.int().tolist() if boxes.id is not None else [None] * len(cls_ids)
+
+            for cls_id, cls_conf, track_id in zip(cls_ids, confs, track_ids):
+                label = get_label(cls_id)
+                current_counts[label] += 1
+                if track_id is not None:
+                    new_track_keys.append((label, int(track_id)))
+                if label in alert_targets and float(cls_conf) >= alert_confidence:
+                    fired_alerts.append(f"{label}|{float(cls_conf):.2f}")
+
+        with RUNTIME.lock:
+            for track_key in new_track_keys:
+                if track_key not in RUNTIME.seen_tracks:
+                    RUNTIME.seen_tracks.add(track_key)
+                    RUNTIME.session_track_counts[track_key[0]] += 1
+
+            for alert_item in fired_alerts:
+                label, score = alert_item.split("|")
+                last_ts = RUNTIME.last_alert_time.get(label, 0.0)
+                if now - last_ts >= alert_cooldown_sec:
+                    latest_alert = (
+                        f"Alert: {label} ({score}) at {datetime.now().strftime('%H:%M:%S')}"
+                    )
+                    RUNTIME.last_alert_time[label] = now
+                    RUNTIME.latest_alert_message = latest_alert
+                    RUNTIME.alert_history.append(latest_alert)
+            RUNTIME.alert_history = RUNTIME.alert_history[-20:]
+
+            RUNTIME.frames_processed += 1
+            RUNTIME.fps_window_count += 1
+            elapsed = now - RUNTIME.fps_window_start
+            if elapsed >= 1.0:
+                RUNTIME.fps = RUNTIME.fps_window_count / max(elapsed, 1e-6)
+                RUNTIME.fps_window_count = 0
+                RUNTIME.fps_window_start = now
+
+            RUNTIME.current_frame_counts = current_counts
+            if latest_alert:
+                RUNTIME.latest_alert_message = latest_alert
+
+            annotated = overlay_hud(
+                annotated,
+                fps=RUNTIME.fps,
+                current_counts=current_counts,
+                latest_alert=RUNTIME.latest_alert_message,
+            )
+
+            RUNTIME.latest_annotated_frame = annotated.copy()
+
+            if auto_capture and sum(current_counts.values()) > 0:
+                if now - RUNTIME.last_auto_capture_ts >= auto_capture_interval_sec:
+                    save_frame(annotated, "auto_capture")
+                    RUNTIME.saved_frames += 1
+                    RUNTIME.last_auto_capture_ts = now
+
+        return av.VideoFrame.from_ndarray(annotated, format="bgr24")
+
+    return callback
+
+
+st.set_page_config(page_title="Live Object Detection & Tracing", layout="wide")
+
+RUNTIME = get_runtime()
+model = load_model()
+available_labels = get_model_names(model)
+
+st.markdown(
+    """
+<style>
+div.block-container {
+    padding-top: 0.9rem;
+    padding-bottom: 0.8rem;
+    max-width: 1220px;
+}
+h1, h2, h3 {
+    letter-spacing: -0.01em;
+}
+[data-testid="stMetricValue"] {
+    font-size: 1.25rem;
+}
+.small-note {
+    color: #67707a;
+    font-size: 0.86rem;
+}
+</style>
+""",
+    unsafe_allow_html=True,
+)
+
+st.title("Live Object Detection & Tracing")
+st.write(
+    f"Real-time {MODEL_WEIGHTS} detection and tracking with compact controls, alerting, and frame capture."
+)
+
+with st.sidebar:
+    st.header("Detection")
+    conf_threshold = st.slider("Confidence", 0.10, 0.95, 0.50, 0.05)
+    iou_threshold = st.slider("IoU", 0.10, 0.95, 0.50, 0.05)
+    inference_size = st.select_slider(
+        "Inference Size",
+        options=[320, 416, 512, 640],
+        value=416,
+        help="Lower value = faster inference; higher value = better detail.",
+    )
+    process_every_n_frames = st.select_slider(
+        "Infer Every N Frames",
+        options=[1, 2, 3],
+        value=1,
+        help="Set to 2 or 3 for smoother preview on low-end devices.",
+    )
+
+    st.header("Alerts")
+    alert_targets = st.multiselect(
+        "Target Objects",
+        options=available_labels,
+        default=["person", "cell phone", "bottle"]
+        if all(x in available_labels for x in ["person", "cell phone", "bottle"])
+        else available_labels[:3],
+    )
+    alert_confidence = st.slider("Min Alert Confidence", 0.10, 0.99, 0.60, 0.05)
+    alert_cooldown_sec = st.slider("Alert Cooldown (s)", 1.0, 20.0, 4.0, 1.0)
+
+    st.header("Capture")
+    auto_capture = st.checkbox("Auto-save on detection", value=False)
+    auto_capture_interval_sec = st.slider(
+        "Auto-capture interval (s)",
+        1.0,
+        30.0,
+        5.0,
+        1.0,
+        disabled=not auto_capture,
+    )
+
+    if st.button("Reset Session Stats"):
+        reset_runtime()
+        st.success("Session stats reset.")
+
+video_callback = create_video_callback(
+    model=model,
+    conf_threshold=conf_threshold,
+    iou_threshold=iou_threshold,
+    alert_targets=set(alert_targets),
+    alert_confidence=alert_confidence,
+    alert_cooldown_sec=alert_cooldown_sec,
+    auto_capture=auto_capture,
+    auto_capture_interval_sec=auto_capture_interval_sec,
+    process_every_n_frames=process_every_n_frames,
+    inference_size=inference_size,
+)
+
+video_col, info_col = st.columns([1.9, 1.1], gap="medium")
+
+with video_col:
+    st.subheader("Live Preview")
+    webrtc_streamer(
+        key="object-detection",
+        video_frame_callback=video_callback,
+        async_processing=True,
+        rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
+        media_stream_constraints={"video": True, "audio": False},
+    )
+    st.markdown(
+        '<div class="small-note">Tip: Use "Infer Every N Frames" = 2 for smoother playback on weaker machines.</div>',
+        unsafe_allow_html=True,
+    )
+
+with info_col:
+    stats = snapshot_runtime()
+    m1, m2 = st.columns(2)
+    m1.metric("Frames", stats["frames_processed"])
+    m2.metric("FPS", f"{stats['fps']:.1f}")
+    st.metric("Saved Frames", stats["saved_frames"])
+
+    if stats["latest_alert_message"]:
+        st.warning(stats["latest_alert_message"])
+    else:
+        st.caption("No active alerts.")
+
+    if st.button("Save Current Frame", use_container_width=True):
+        with RUNTIME.lock:
+            frame_copy = (
+                None if RUNTIME.latest_annotated_frame is None else RUNTIME.latest_annotated_frame.copy()
+            )
+        if frame_copy is None:
+            st.error("Start camera streaming first.")
+        else:
+            saved_to = save_frame(frame_copy, "manual_capture")
+            with RUNTIME.lock:
+                RUNTIME.saved_frames += 1
+            st.success(f"Saved: {saved_to}")
+
+    with st.expander("Current Counts", expanded=True):
+        if stats["current_frame_counts"]:
+            st.table(
+                [
+                    {"Object": obj, "Count": cnt}
+                    for obj, cnt in sorted(
+                        stats["current_frame_counts"].items(), key=lambda x: x[1], reverse=True
+                    )[:8]
+                ]
+            )
+        else:
+            st.caption("No detections yet.")
+
+    with st.expander("Session Tracks", expanded=False):
+        if stats["session_track_counts"]:
+            st.table(
+                [
+                    {"Object": obj, "Tracks": cnt}
+                    for obj, cnt in sorted(
+                        stats["session_track_counts"].items(), key=lambda x: x[1], reverse=True
+                    )[:8]
+                ]
+            )
+        else:
+            st.caption("No tracking data yet.")
+
+    with st.expander("Recent Alerts", expanded=False):
+        if stats["alert_history"]:
+            for alert_line in stats["alert_history"]:
+                st.write(f"- {alert_line}")
+        else:
+            st.caption("No alerts recorded.")
+
+with st.expander("Saved Captures", expanded=False):
+    saved_images = sorted(CAPTURE_DIR.glob("*.jpg"), key=lambda p: p.stat().st_mtime, reverse=True)[:6]
+    if saved_images:
+        gallery_columns = st.columns(3)
+        for idx, image_path in enumerate(saved_images):
+            with gallery_columns[idx % 3]:
+                st.image(str(image_path), caption=image_path.name, use_container_width=True)
+    else:
+        st.caption("No saved captures yet.")
