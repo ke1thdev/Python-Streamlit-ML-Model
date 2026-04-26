@@ -615,45 +615,46 @@ with video_col:
     )
 
 with info_col:
-    stats = snapshot_runtime()
-    m1, m2 = st.columns(2)
-    m1.metric("Frames", stats["frames_processed"])
-    m2.metric("FPS", f"{stats['fps']:.1f}")
+    @st.fragment(run_every="1s")
+    def render_live_stats() -> None:
+        stats = snapshot_runtime()
 
-    if stats["latest_alert_message"]:
-        st.warning(stats["latest_alert_message"])
-    else:
-        st.caption("No active alerts.")
-
-    with st.expander("Current Counts", expanded=True):
-        if stats["current_frame_counts"]:
-            st.table(
-                [
-                    {"Object": obj, "Count": cnt}
-                    for obj, cnt in sorted(
-                        stats["current_frame_counts"].items(), key=lambda x: x[1], reverse=True
-                    )[:8]
-                ]
-            )
+        if stats["latest_alert_message"]:
+            st.warning(stats["latest_alert_message"])
         else:
-            st.caption("No detections yet.")
+            st.caption("No active alerts.")
 
-    with st.expander("Session Tracks", expanded=False):
-        if stats["session_track_counts"]:
-            st.table(
-                [
-                    {"Object": obj, "Tracks": cnt}
-                    for obj, cnt in sorted(
-                        stats["session_track_counts"].items(), key=lambda x: x[1], reverse=True
-                    )[:8]
-                ]
-            )
-        else:
-            st.caption("No tracking data yet.")
+        with st.expander("Current Counts", expanded=True):
+            if stats["current_frame_counts"]:
+                st.table(
+                    [
+                        {"Object": obj, "Count": cnt}
+                        for obj, cnt in sorted(
+                            stats["current_frame_counts"].items(), key=lambda x: x[1], reverse=True
+                        )[:8]
+                    ]
+                )
+            else:
+                st.caption("No detections yet.")
 
-    with st.expander("Recent Alerts", expanded=False):
-        if stats["alert_history"]:
-            for alert_line in stats["alert_history"]:
-                st.write(f"- {alert_line}")
-        else:
-            st.caption("No alerts recorded.")
+        with st.expander("Session Tracks", expanded=False):
+            if stats["session_track_counts"]:
+                st.table(
+                    [
+                        {"Object": obj, "Tracks": cnt}
+                        for obj, cnt in sorted(
+                            stats["session_track_counts"].items(), key=lambda x: x[1], reverse=True
+                        )[:8]
+                    ]
+                )
+            else:
+                st.caption("No tracking data yet.")
+
+        with st.expander("Recent Alerts", expanded=False):
+            if stats["alert_history"]:
+                for alert_line in stats["alert_history"]:
+                    st.write(f"- {alert_line}")
+            else:
+                st.caption("No alerts recorded.")
+
+    render_live_stats()
