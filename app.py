@@ -8,6 +8,7 @@ from threading import Lock
 from typing import Any
 import os
 import time
+import math
 
 import av
 import cv2
@@ -39,6 +40,8 @@ class RuntimeState:
     alert_history: list[str] = field(default_factory=list)
     saved_frames: int = 0
     last_auto_capture_ts: float = 0.0
+    next_track_id: int = 1
+    active_tracks: dict[int, dict[str, Any]] = field(default_factory=dict)
 
 @st.cache_resource
 def get_runtime() -> RuntimeState:
@@ -94,6 +97,65 @@ def reset_runtime() -> None:
         RUNTIME.alert_history = []
         RUNTIME.saved_frames = 0
         RUNTIME.last_auto_capture_ts = 0.0
+        RUNTIME.next_track_id = 1
+        RUNTIME.active_tracks = {}
+
+
+def assign_lightweight_tracks(
+    detections: list[dict[str, Any]],
+    now_ts: float,
+    max_distance: float = 80.0,
+    max_idle_sec: float = 1.5,
+) -> list[tuple[int, dict[str, Any]]]:
+    """
+    Lightweight tracker that avoids external LAP dependency.
+    Matches detections to existing tracks by label + centroid distance.
+    """
+    with RUNTIME.lock:
+        # Drop stale tracks.
+        stale_ids = [
+            tid
+            for tid, trk in RUNTIME.active_tracks.items()
+            if (now_ts - float(trk["last_seen"])) > max_idle_sec
+        ]
+        for tid in stale_ids:
+            del RUNTIME.active_tracks[tid]
+
+        assignments: list[tuple[int, dict[str, Any]]] = []
+        used_track_ids: set[int] = set()
+
+        for det in detections:
+            label = str(det["label"])
+            cx, cy = det["cx"], det["cy"]
+            best_track_id = None
+            best_distance = float("inf")
+
+            for track_id, trk in RUNTIME.active_tracks.items():
+                if track_id in used_track_ids:
+                    continue
+                if trk["label"] != label:
+                    continue
+                tx, ty = trk["cx"], trk["cy"]
+                dist = math.hypot(cx - tx, cy - ty)
+                if dist < best_distance and dist <= max_distance:
+                    best_distance = dist
+                    best_track_id = track_id
+
+            if best_track_id is None:
+                best_track_id = RUNTIME.next_track_id
+                RUNTIME.next_track_id += 1
+                RUNTIME.session_track_counts[label] += 1
+
+            RUNTIME.active_tracks[best_track_id] = {
+                "label": label,
+                "cx": cx,
+                "cy": cy,
+                "last_seen": now_ts,
+            }
+            used_track_ids.add(best_track_id)
+            assignments.append((best_track_id, det))
+
+        return assignments
 
 
 def overlay_hud(frame: Any, fps: float, current_counts: Counter, latest_alert: str) -> Any:
@@ -184,9 +246,8 @@ def create_video_callback(
             if cached is not None:
                 return av.VideoFrame.from_ndarray(cached, format="bgr24")
 
-        results = model.track(
+        results = model.predict(
             img,
-            persist=True,
             conf=conf_threshold,
             iou=iou_threshold,
             imgsz=inference_size,
@@ -202,24 +263,34 @@ def create_video_callback(
         fired_alerts: list[str] = []
 
         boxes = result.boxes
-        if boxes is not None and boxes.cls is not None:
+        detections: list[dict[str, Any]] = []
+        if boxes is not None and boxes.cls is not None and boxes.xyxy is not None:
             cls_ids = boxes.cls.int().tolist()
             confs = boxes.conf.tolist() if boxes.conf is not None else [1.0] * len(cls_ids)
-            track_ids = boxes.id.int().tolist() if boxes.id is not None else [None] * len(cls_ids)
+            bboxes = boxes.xyxy.tolist()
 
-            for cls_id, cls_conf, track_id in zip(cls_ids, confs, track_ids):
+            for cls_id, cls_conf, bbox in zip(cls_ids, confs, bboxes):
+                x1, y1, x2, y2 = bbox
                 label = get_label(cls_id)
                 current_counts[label] += 1
-                if track_id is not None:
-                    new_track_keys.append((label, int(track_id)))
+                detections.append(
+                    {
+                        "label": label,
+                        "conf": float(cls_conf),
+                        "bbox": (int(x1), int(y1), int(x2), int(y2)),
+                        "cx": float((x1 + x2) / 2.0),
+                        "cy": float((y1 + y2) / 2.0),
+                    }
+                )
                 if label in alert_targets and float(cls_conf) >= alert_confidence:
                     fired_alerts.append(f"{label}|{float(cls_conf):.2f}")
 
+        for track_id, det in assign_lightweight_tracks(detections, now_ts=now):
+            new_track_keys.append((det["label"], int(track_id)))
+
         with RUNTIME.lock:
             for track_key in new_track_keys:
-                if track_key not in RUNTIME.seen_tracks:
-                    RUNTIME.seen_tracks.add(track_key)
-                    RUNTIME.session_track_counts[track_key[0]] += 1
+                RUNTIME.seen_tracks.add(track_key)
 
             for alert_item in fired_alerts:
                 label, score = alert_item.split("|")
@@ -390,13 +461,23 @@ video_col, info_col = st.columns([1.9, 1.1], gap="medium")
 
 with video_col:
     st.subheader("Live Preview")
-    webrtc_streamer(
-        key="object-detection",
-        video_frame_callback=video_callback,
-        async_processing=True,
-        rtc_configuration=build_rtc_configuration(),
-        media_stream_constraints={"video": True, "audio": False},
-    )
+    try:
+        webrtc_streamer(
+            key="object-detection",
+            video_frame_callback=video_callback,
+            async_processing=True,
+            rtc_configuration=build_rtc_configuration(),
+            media_stream_constraints={"video": True, "audio": False},
+        )
+    except Exception as webrtc_error:
+        st.error(
+            "WebRTC session failed to initialize in this environment. "
+            "Use the fallback capture below or redeploy with Python 3.11."
+        )
+        st.caption(f"WebRTC error: {type(webrtc_error).__name__}")
+        fallback_capture = st.camera_input("Fallback Camera Capture")
+        if fallback_capture is not None:
+            st.info("Fallback mode captured an image. WebRTC realtime streaming is unavailable.")
     st.markdown(
         '<div class="small-note">Tip: Use "Infer Every N Frames" = 2 for smoother playback on weaker machines.</div>',
         unsafe_allow_html=True,
