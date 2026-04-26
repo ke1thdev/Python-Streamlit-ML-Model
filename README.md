@@ -7,7 +7,7 @@
   <img alt="YOLOv8" src="https://img.shields.io/badge/YOLOv8-Ultralytics-111111" />
   <img alt="WebRTC" src="https://img.shields.io/badge/WebRTC-Live%20Video-0A66C2" />
   <img alt="Status" src="https://img.shields.io/badge/Project-Complete-2E7D32" />
-  <img alt="Views" src="https://hits.seeyoufarm.com/api/count/incr/badge.svg?url=https%3A%2F%2Fgithub.com%2Fkeithdev%2Fpython-streamlit-ml-model&count_bg=%232E7D32&title_bg=%23555555&icon=github.svg&icon_color=%23FFFFFF&title=Views&edge_flat=false" />
+  <img alt="Views" src="https://komarev.com/ghpvc/?username=keithdev&repo=python-streamlit-ml-model&label=Views&color=2E7D32&style=flat" />
 </p>
 
 <hr />
