@@ -11,9 +11,21 @@ import time
 import math
 
 import av
-import cv2
+import numpy as np
 import streamlit as st
-from streamlit_webrtc import webrtc_streamer
+try:
+    import cv2
+    CV2_IMPORT_ERROR = ""
+except Exception as cv2_error:
+    cv2 = None
+    CV2_IMPORT_ERROR = str(cv2_error)
+
+try:
+    from streamlit_webrtc import webrtc_streamer
+    WEBRTC_IMPORT_ERROR = ""
+except Exception as webrtc_import_error:
+    webrtc_streamer = None
+    WEBRTC_IMPORT_ERROR = str(webrtc_import_error)
 from ultralytics import YOLO
 
 
@@ -62,6 +74,8 @@ def get_model_names(model: YOLO) -> list[str]:
 
 
 def save_frame(image: Any, reason: str) -> str:
+    if cv2 is None:
+        return ""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     out_path = CAPTURE_DIR / f"{reason}_{timestamp}.jpg"
     cv2.imwrite(str(out_path), image)
@@ -159,6 +173,8 @@ def assign_lightweight_tracks(
 
 
 def overlay_hud(frame: Any, fps: float, current_counts: Counter, latest_alert: str) -> Any:
+    if cv2 is None:
+        return frame
     hud = frame.copy()
     cv2.rectangle(hud, (10, 10), (520, 160), (0, 0, 0), -1)
     cv2.addWeighted(hud, 0.35, frame, 0.65, 0, frame)
@@ -366,12 +382,86 @@ def build_rtc_configuration() -> dict[str, Any]:
 
     return {"iceServers": ice_servers, "iceTransportPolicy": "all"}
 
+def process_snapshot_frame(
+    img: Any,
+    model: YOLO,
+    conf_threshold: float,
+    iou_threshold: float,
+    alert_targets: set[str],
+    alert_confidence: float,
+    alert_cooldown_sec: float,
+    inference_size: int,
+) -> Any:
+    now = time.time()
+    result = model.predict(
+        img,
+        conf=conf_threshold,
+        iou=iou_threshold,
+        imgsz=inference_size,
+        max_det=24,
+        verbose=False,
+    )[0]
+
+    annotated = result.plot()
+    current_counts: Counter = Counter()
+    latest_alert = ""
+    fired_alerts: list[str] = []
+    detections: list[dict[str, Any]] = []
+
+    names = model.names
+    boxes = result.boxes
+    if boxes is not None and boxes.cls is not None and boxes.xyxy is not None:
+        cls_ids = boxes.cls.int().tolist()
+        confs = boxes.conf.tolist() if boxes.conf is not None else [1.0] * len(cls_ids)
+        bboxes = boxes.xyxy.tolist()
+        for cls_id, cls_conf, bbox in zip(cls_ids, confs, bboxes):
+            x1, y1, x2, y2 = bbox
+            label = str(names.get(int(cls_id), cls_id)) if isinstance(names, dict) else str(names[int(cls_id)])
+            current_counts[label] += 1
+            detections.append(
+                {
+                    "label": label,
+                    "cx": float((x1 + x2) / 2.0),
+                    "cy": float((y1 + y2) / 2.0),
+                }
+            )
+            if label in alert_targets and float(cls_conf) >= alert_confidence:
+                fired_alerts.append(f"{label}|{float(cls_conf):.2f}")
+
+    assign_lightweight_tracks(detections, now_ts=now)
+
+    with RUNTIME.lock:
+        for alert_item in fired_alerts:
+            label, score = alert_item.split("|")
+            last_ts = RUNTIME.last_alert_time.get(label, 0.0)
+            if now - last_ts >= alert_cooldown_sec:
+                latest_alert = f"Alert: {label} ({score}) at {datetime.now().strftime('%H:%M:%S')}"
+                RUNTIME.last_alert_time[label] = now
+                RUNTIME.latest_alert_message = latest_alert
+                RUNTIME.alert_history.append(latest_alert)
+        RUNTIME.alert_history = RUNTIME.alert_history[-20:]
+        RUNTIME.frames_processed += 1
+        RUNTIME.current_frame_counts = current_counts
+        RUNTIME.latest_annotated_frame = annotated.copy()
+
+    return overlay_hud(
+        annotated,
+        fps=RUNTIME.fps,
+        current_counts=current_counts,
+        latest_alert=RUNTIME.latest_alert_message,
+    )
+
 
 st.set_page_config(page_title="Live Object Detection & Tracing", layout="wide")
 
 RUNTIME = get_runtime()
 model = load_model()
 available_labels = get_model_names(model)
+
+if cv2 is None:
+    st.error("OpenCV failed to load in this environment.")
+    st.code(CV2_IMPORT_ERROR)
+    st.stop()
 
 st.markdown(
     """
@@ -402,6 +492,18 @@ st.write(
 )
 
 with st.sidebar:
+    is_cloud = bool(os.getenv("STREAMLIT_SHARING_MODE")) or "/mount/src" in str(Path.cwd()).replace("\\", "/")
+    default_mode = "Stable Snapshot"
+    if not is_cloud and webrtc_streamer is not None:
+        default_mode = "Realtime WebRTC (Beta)"
+
+    capture_mode = st.selectbox(
+        "Capture Mode",
+        options=["Stable Snapshot", "Realtime WebRTC (Beta)"],
+        index=0 if default_mode == "Stable Snapshot" else 1,
+        help="Use Stable Snapshot on Streamlit Cloud. WebRTC can crash on Python 3.14 runtimes.",
+    )
+
     st.header("Detection")
     conf_threshold = st.slider("Confidence", 0.10, 0.95, 0.50, 0.05)
     iou_threshold = st.slider("IoU", 0.10, 0.95, 0.50, 0.05)
@@ -461,25 +563,48 @@ video_col, info_col = st.columns([1.9, 1.1], gap="medium")
 
 with video_col:
     st.subheader("Live Preview")
-    try:
-        webrtc_streamer(
-            key="object-detection",
-            video_frame_callback=video_callback,
-            async_processing=True,
-            rtc_configuration=build_rtc_configuration(),
-            media_stream_constraints={"video": True, "audio": False},
-        )
-    except Exception as webrtc_error:
-        st.error(
-            "WebRTC session failed to initialize in this environment. "
-            "Use the fallback capture below or redeploy with Python 3.11."
-        )
-        st.caption(f"WebRTC error: {type(webrtc_error).__name__}")
-        fallback_capture = st.camera_input("Fallback Camera Capture")
-        if fallback_capture is not None:
-            st.info("Fallback mode captured an image. WebRTC realtime streaming is unavailable.")
+    if capture_mode == "Realtime WebRTC (Beta)":
+        if webrtc_streamer is None:
+            st.error("streamlit-webrtc import failed. Switch to Stable Snapshot mode.")
+            st.code(WEBRTC_IMPORT_ERROR)
+        else:
+            try:
+                webrtc_streamer(
+                    key="object-detection",
+                    video_frame_callback=video_callback,
+                    async_processing=True,
+                    rtc_configuration=build_rtc_configuration(),
+                    media_stream_constraints={"video": True, "audio": False},
+                )
+            except Exception as webrtc_error:
+                st.error(
+                    "WebRTC session failed. Switch Capture Mode to Stable Snapshot."
+                )
+                st.caption(f"WebRTC error: {type(webrtc_error).__name__}")
+    else:
+        snapshot = st.camera_input("Take a Snapshot")
+        if snapshot is not None:
+            file_bytes = snapshot.getvalue()
+            arr = cv2.imdecode(
+                np.frombuffer(file_bytes, dtype=np.uint8),  # type: ignore[name-defined]
+                cv2.IMREAD_COLOR,
+            )
+            if arr is not None:
+                out = process_snapshot_frame(
+                    arr,
+                    model=model,
+                    conf_threshold=conf_threshold,
+                    iou_threshold=iou_threshold,
+                    alert_targets=set(alert_targets),
+                    alert_confidence=alert_confidence,
+                    alert_cooldown_sec=alert_cooldown_sec,
+                    inference_size=inference_size,
+                )
+                st.image(out, channels="BGR", use_container_width=True)
+            else:
+                st.error("Could not decode snapshot image.")
     st.markdown(
-        '<div class="small-note">Tip: Use "Infer Every N Frames" = 2 for smoother playback on weaker machines.</div>',
+        '<div class="small-note">Tip: Stable Snapshot mode is recommended for Streamlit Cloud reliability.</div>',
         unsafe_allow_html=True,
     )
 
